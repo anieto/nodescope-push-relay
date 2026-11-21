@@ -261,3 +261,12 @@ A provider acceptance is separate from OS presentation. End-to-end acceptance
 requires seeing the alert on both locked test phones and opening the correct
 analyzer and node from each alert. A device may still show an alert the
 provider accepted before opt-out.
+
+## License
+
+Copyright (C) 2026 Adam
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See [LICENSE](LICENSE).
