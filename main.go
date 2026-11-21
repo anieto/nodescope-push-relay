@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -48,6 +49,15 @@ func run() error {
 	}
 	if err != nil {
 		return err
+	}
+	// Off by default: NodeScope re-registers on unknown_installation only
+	// from the release that added it, so enable this after that ships.
+	if raw := os.Getenv("RELAY_INSTALLATION_IDLE_DAYS"); raw != "" {
+		days, err := strconv.Atoi(raw)
+		if err != nil || days < 0 || days > 3650 {
+			return errors.New("RELAY_INSTALLATION_IDLE_DAYS must be a whole number of days from 0 to 3650")
+		}
+		store.SetInstallationIdle(time.Duration(days) * 24 * time.Hour)
 	}
 	var fetchProof enrollmentProofFetcher
 	switch os.Getenv("RELAY_SELF_ENROLL") {

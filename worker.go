@@ -28,9 +28,16 @@ func drainQueue(ctx context.Context, store *Store, send sendPush) error {
 func runWorker(ctx context.Context, store *Store, send sendPush) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	var lastPrune time.Time
 	for ctx.Err() == nil {
 		if err := drainQueue(ctx, store, send); err != nil && ctx.Err() == nil {
 			log.Print("delivery queue iteration failed")
+		}
+		if time.Since(lastPrune) >= relayPruneInterval {
+			lastPrune = time.Now()
+			if err := store.Prune(); err != nil && ctx.Err() == nil {
+				log.Print("state prune failed")
+			}
 		}
 		select {
 		case <-ctx.Done():

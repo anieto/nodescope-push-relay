@@ -25,11 +25,23 @@ const (
 	relaySubscriptionLifetime = 30 * 24 * time.Hour
 	relayDedupRetention       = 24 * time.Hour
 	relayEventLifetime        = time.Hour
-	relayMaxAnalyzers         = 128
-	relayMaxInstallations     = 2048
-	relayMaxProofs            = 4096
-	relayMaxSubscriptions     = 8192
-	relayMaxDeliveries        = 10000
+	// Deliveries are kept only long enough to answer an analyzer's retry of
+	// the same event idempotently: events live at most relayEventLifetime.
+	relayDeliveryRetention = time.Hour
+	relayPruneInterval     = 10 * time.Minute
+
+	// Shared caps only bound memory and the state file. Each one sits well
+	// above what per-owner quotas let a single installation, analyzer or
+	// enrollment domain reach, so one owner cannot lock everyone else out.
+	relayMaxAnalyzers             = 128  // active (not revoked)
+	relayMaxAnalyzerRecords       = 1024 // including revoked
+	relaySelfEnrollPerDomain      = 2    // per registrable domain per day
+	relayMaxInstallations         = 2048
+	relayMaxProofs                = 65536
+	relayMaxUnusedProofs          = 8 // per installation
+	relayMaxSubscriptions         = 8192
+	relayMaxDeliveries            = 20000
+	relayMaxDeliveriesPerAnalyzer = 500 // retained, all states
 )
 
 type enrollmentRecord struct {
@@ -42,12 +54,20 @@ type analyzerRecord struct {
 	Origin         string
 	CredentialHash string
 	Revoked        bool
+	// EnrolledAt and SelfEnrolled are zero for records from before they
+	// existed; such records never count toward the self-enrollment rate.
+	EnrolledAt   time.Time
+	SelfEnrolled bool
 }
 
 type installationRecord struct {
 	Provider, Environment string
 	Token, CredentialHash string
 	Generation            uint64
+	// LastActiveAt is the last registration, token update, link proof or
+	// link. Zero for records from before it existed: Prune treats those as
+	// active as of the first prune after the upgrade.
+	LastActiveAt time.Time
 }
 
 type proofRecord struct {
@@ -92,6 +112,18 @@ type Store struct {
 	state        relayState
 	activeClaims map[string]uint64
 	deliveryKeys map[deliveryKey]string
+	// installationIdle removes installations with no active subscription
+	// after this long without activity. Zero keeps them (the default):
+	// clients must re-register on unknown_installation before it is enabled.
+	installationIdle time.Duration
+}
+
+// SetInstallationIdle sets how long an installation without an active
+// subscription is kept after its last activity. Zero disables removal.
+func (s *Store) SetInstallationIdle(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.installationIdle = max(d, 0)
 }
 
 func OpenStore(path string, now func() time.Time) (*Store, error) {
@@ -321,7 +353,16 @@ func (s *Store) enrollOrigin(next relayState, origin, credential string, allowRe
 	credentialHash := hashSecret(credential)
 	var existingID string
 	originKey := enrollmentOriginKey(origin)
+	now := s.now().UTC()
+	domain := registrableDomain(origin)
+	active, recentForDomain := 0, 0
 	for id, record := range next.Analyzers {
+		if !record.Revoked {
+			active++
+		}
+		if record.SelfEnrolled && record.EnrolledAt.After(now.Add(-24*time.Hour)) && registrableDomain(record.Origin) == domain {
+			recentForDomain++
+		}
 		if enrollmentOriginKey(record.Origin) == originKey && !record.Revoked {
 			if allowRetry && record.CredentialHash == credentialHash {
 				existingID = id
@@ -336,12 +377,17 @@ func (s *Store) enrollOrigin(next relayState, origin, credential string, allowRe
 	if existingID != "" {
 		return Enrollment{AnalyzerID: existingID, SenderCredential: credential}, nil
 	}
-	if len(next.Analyzers) >= relayMaxAnalyzers {
+	// allowRetry marks self-enrollment: one domain with wildcard DNS can
+	// prove any number of origins, so its rate is bounded per domain.
+	if allowRetry && recentForDomain >= relaySelfEnrollPerDomain {
+		return Enrollment{}, storeError(429, "domain_enrollment_limit")
+	}
+	if active >= relayMaxAnalyzers || len(next.Analyzers) >= relayMaxAnalyzerRecords {
 		return Enrollment{}, storeError(429, "analyzer_limit")
 	}
 	id := newID("an")
 	next.Analyzers = maps.Clone(next.Analyzers)
-	next.Analyzers[id] = analyzerRecord{Origin: origin, CredentialHash: credentialHash}
+	next.Analyzers[id] = analyzerRecord{Origin: origin, CredentialHash: credentialHash, EnrolledAt: now, SelfEnrolled: allowRetry}
 	if err := s.commit(next); err != nil {
 		return Enrollment{}, err
 	}
@@ -424,8 +470,26 @@ func (s *Store) tokenClaimed(id, provider, env, token string) bool {
 	return false
 }
 
+// validProviderToken checks a push token's shape. Simulation accepts any
+// printable token so tests and local runs can use readable fixtures.
+func (s *Store) validProviderToken(provider, token string) bool {
+	if len(token) > 4096 || !relayTokenPattern.MatchString(token) {
+		return false
+	}
+	if s.mode == "simulate" {
+		return true
+	}
+	switch provider {
+	case "apns":
+		return len(token) >= 64 && validAPNsDeviceToken(token)
+	case "fcm":
+		return len(token) >= 32 && fcmTokenPattern.MatchString(token)
+	}
+	return false
+}
+
 func (s *Store) RegisterInstallation(req InstallRequest) (Installation, error) {
-	if !validEnvironment(req.Provider, req.Environment) || (s.mode != "simulate" && req.Environment != providerEnvironment(s.mode, req.Provider)) || (len(req.Token) > 4096 || !relayTokenPattern.MatchString(req.Token)) {
+	if !validEnvironment(req.Provider, req.Environment) || (s.mode != "simulate" && req.Environment != providerEnvironment(s.mode, req.Provider)) || !s.validProviderToken(req.Provider, req.Token) {
 		return Installation{}, storeError(400, "invalid_installation")
 	}
 	s.mu.Lock()
@@ -441,7 +505,7 @@ func (s *Store) RegisterInstallation(req InstallRequest) (Installation, error) {
 	next.Installations = maps.Clone(next.Installations)
 	next.Installations[id] = installationRecord{
 		Provider: req.Provider, Environment: req.Environment, Token: req.Token,
-		CredentialHash: hashSecret(credential), Generation: 1,
+		CredentialHash: hashSecret(credential), Generation: 1, LastActiveAt: s.now().UTC(),
 	}
 	if err := s.commit(next); err != nil {
 		return Installation{}, err
@@ -449,9 +513,16 @@ func (s *Store) RegisterInstallation(req InstallRequest) (Installation, error) {
 	return Installation{InstallationID: id, InstallationCredential: credential}, nil
 }
 
+// authenticateInstallation answers 404 unknown_installation for an ID the
+// relay does not hold (never issued, or removed as idle) so a client knows
+// to register again, and 401 for a wrong credential. Installation IDs are
+// 256-bit random values, so the distinction reveals nothing guessable.
 func (s *Store) authenticateInstallation(id, credential string) (installationRecord, error) {
 	record, exists := s.state.Installations[id]
-	if !exists || !relaySecretPattern.MatchString(credential) || record.CredentialHash != hashSecret(credential) {
+	if !exists {
+		return installationRecord{}, storeError(404, "unknown_installation")
+	}
+	if !relaySecretPattern.MatchString(credential) || record.CredentialHash != hashSecret(credential) {
 		return installationRecord{}, storeError(401, "invalid_credential")
 	}
 	return record, nil
@@ -467,7 +538,20 @@ func (s *Store) UpdateToken(id, credential string, req TokenRequest) error {
 	if err != nil {
 		return err
 	}
+	if !s.validProviderToken(record.Provider, req.Token) {
+		return storeError(400, "invalid_token")
+	}
+	now := s.now().UTC()
 	if record.Token == req.Token {
+		// Apps refresh their token on launch; count that as activity, but
+		// write at most once a day for it.
+		if s.installationIdle > 0 && now.Sub(record.LastActiveAt) >= 24*time.Hour {
+			next := s.state
+			next.Installations = maps.Clone(next.Installations)
+			record.LastActiveAt = now
+			next.Installations[id] = record
+			return s.commit(next)
+		}
 		return nil
 	}
 	if s.tokenClaimed(id, record.Provider, record.Environment, req.Token) {
@@ -477,6 +561,7 @@ func (s *Store) UpdateToken(id, credential string, req TokenRequest) error {
 	next.Installations = maps.Clone(next.Installations)
 	record.Token = req.Token
 	record.Generation++
+	record.LastActiveAt = now
 	next.Installations[id] = record
 	return s.commit(next)
 }
@@ -487,7 +572,8 @@ func (s *Store) LinkProof(id, credential, analyzerID string) (Proof, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.authenticateInstallation(id, credential); err != nil {
+	install, err := s.authenticateInstallation(id, credential)
+	if err != nil {
 		return Proof{}, err
 	}
 	if record, exists := s.state.Analyzers[analyzerID]; !exists || record.Revoked {
@@ -496,20 +582,26 @@ func (s *Store) LinkProof(id, credential, analyzerID string) (Proof, error) {
 	now := s.now().UTC()
 	next := s.state
 	next.Proofs = maps.Clone(next.Proofs)
+	pruneProofs(next.Proofs, now)
 	unused := 0
-	for key, record := range next.Proofs {
-		if !record.ExpiresAt.Add(relayDedupRetention).After(now) {
-			delete(next.Proofs, key)
-		}
-		if record.InstallationID == id && record.SubscriptionID == "" && record.ExpiresAt.After(now) {
+	for _, record := range next.Proofs {
+		if record.InstallationID == id && record.SubscriptionID == "" {
 			unused++
 		}
 	}
-	if len(next.Proofs) >= relayMaxProofs || unused >= 8 {
+	// The per-installation quota is what limits proofs; the shared cap only
+	// bounds memory and sits far above installations × quota.
+	if unused >= relayMaxUnusedProofs {
 		return Proof{}, storeError(429, "link_proof_limit")
+	}
+	if len(next.Proofs) >= relayMaxProofs {
+		return Proof{}, storeError(503, "service_unavailable")
 	}
 	value, expires := secret(), now.Add(relayProofLifetime)
 	next.Proofs[hashSecret(value)] = proofRecord{InstallationID: id, AnalyzerID: analyzerID, ExpiresAt: expires}
+	next.Installations = maps.Clone(next.Installations)
+	install.LastActiveAt = now
+	next.Installations[id] = install
 	if err := s.commit(next); err != nil {
 		return Proof{}, err
 	}
@@ -606,6 +698,11 @@ func (s *Store) Link(credential string, req LinkRequest) (Subscription, error) {
 	next.Subscriptions[subID] = record
 	proof.BindingID, proof.SubscriptionID = req.BindingID, subID
 	next.Proofs[key] = proof
+	if install, ok := next.Installations[req.InstallationID]; ok {
+		next.Installations = maps.Clone(next.Installations)
+		install.LastActiveAt = now
+		next.Installations[req.InstallationID] = install
+	}
 	if err := s.commit(next); err != nil {
 		return Subscription{}, err
 	}
@@ -701,22 +798,27 @@ func (s *Store) Deliver(credential string, req DeliveryRequest) (Delivery, bool,
 	}
 	next := s.state
 	next.Deliveries = maps.Clone(next.Deliveries)
-	analyzerCount, subCount := 0, 0
+	pruneDeliveries(next.Deliveries, now)
+	analyzerCount, subCount, retained := 0, 0, 0
 	hourAgo := now.Add(-time.Hour)
-	for id, record := range next.Deliveries {
-		if !record.Request.ExpiresAt.Add(relayDedupRetention).After(now) {
-			delete(next.Deliveries, id)
+	for _, record := range next.Deliveries {
+		if record.AnalyzerID != analyzerID {
 			continue
 		}
-		if record.AnalyzerID == analyzerID && record.CreatedAt.After(hourAgo) {
+		retained++
+		if record.CreatedAt.After(hourAgo) {
 			analyzerCount++
 			if record.Request.SubscriptionID == req.SubscriptionID {
 				subCount++
 			}
 		}
 	}
-	if len(next.Deliveries) >= relayMaxDeliveries || analyzerCount >= 120 || subCount >= 12 {
+	if analyzerCount >= 120 || subCount >= 12 || retained >= relayMaxDeliveriesPerAnalyzer {
 		return Delivery{}, false, storeError(429, "delivery_limit")
+	}
+	// Per-analyzer quotas are the limit; the shared cap only bounds memory.
+	if len(next.Deliveries) >= relayMaxDeliveries {
+		return Delivery{}, false, storeError(503, "service_unavailable")
 	}
 	id := newID("job")
 	next.Deliveries[id] = deliveryRecord{ID: id, AnalyzerID: analyzerID, Status: "queued", Request: req, CreatedAt: now, NextAt: now}
@@ -806,4 +908,130 @@ func retryDelivery(record deliveryRecord, now time.Time, minimum time.Duration) 
 		record.Status = "retry_exhausted"
 	}
 	return record
+}
+
+var fcmTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_:-]+$`)
+
+// registrableDomain approximates an origin's registrable domain (eTLD+1)
+// without the public suffix list: the last two labels, or the last three
+// under a two-letter country code with a common second-level label
+// (example.co.uk). Shared hosting suffixes such as duckdns.org count as
+// one domain, so their users share the per-domain self-enrollment rate.
+func registrableDomain(origin string) string {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return origin
+	}
+	labels := strings.Split(strings.ToLower(u.Hostname()), ".")
+	n := len(labels)
+	if n <= 2 {
+		return strings.Join(labels, ".")
+	}
+	if len(labels[n-1]) == 2 {
+		switch labels[n-2] {
+		case "co", "com", "net", "org", "gov", "edu", "ac", "or", "ne", "go":
+			return strings.Join(labels[n-3:], ".")
+		}
+	}
+	return strings.Join(labels[n-2:], ".")
+}
+
+// pruneProofs drops unused proofs once expired and used ones after the
+// retention that lets an analyzer retry its link idempotently.
+func pruneProofs(proofs map[string]proofRecord, now time.Time) bool {
+	changed := false
+	for key, record := range proofs {
+		expired := !record.ExpiresAt.After(now)
+		if (record.SubscriptionID == "" && expired) || !record.ExpiresAt.Add(relayDedupRetention).After(now) {
+			delete(proofs, key)
+			changed = true
+		}
+	}
+	return changed
+}
+
+// pruneDeliveries drops deliveries an hour after their event expired; by
+// then no analyzer retry of the event is accepted anyway.
+func pruneDeliveries(deliveries map[string]deliveryRecord, now time.Time) bool {
+	changed := false
+	for id, record := range deliveries {
+		if !record.Request.ExpiresAt.Add(relayDeliveryRetention).After(now) {
+			delete(deliveries, id)
+			changed = true
+		}
+	}
+	return changed
+}
+
+// Prune removes expired records: enrollment codes, proofs, subscriptions a
+// day after they ended, deliveries, and (when enabled) idle installations
+// with no active subscription. It runs periodically so expired data is
+// removed even when no request touches that part of the state.
+func (s *Store) Prune() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now().UTC()
+	next := s.state
+	next.Codes = maps.Clone(next.Codes)
+	next.Proofs = maps.Clone(next.Proofs)
+	next.Subscriptions = maps.Clone(next.Subscriptions)
+	next.Deliveries = maps.Clone(next.Deliveries)
+	next.Installations = maps.Clone(next.Installations)
+	changed := false
+	for key, record := range next.Codes {
+		if !record.ExpiresAt.Add(relayDedupRetention).After(now) {
+			delete(next.Codes, key)
+			changed = true
+		}
+	}
+	if pruneProofs(next.Proofs, now) {
+		changed = true
+	}
+	for id, sub := range next.Subscriptions {
+		if !sub.ExpiresAt.Add(relayDedupRetention).After(now) {
+			delete(next.Subscriptions, id)
+			changed = true
+		}
+	}
+	if pruneDeliveries(next.Deliveries, now) {
+		changed = true
+	}
+	active := make(map[string]bool)
+	for _, sub := range next.Subscriptions {
+		if !sub.Revoked && sub.ExpiresAt.After(now) {
+			active[sub.InstallationID] = true
+		}
+	}
+	for id, install := range next.Installations {
+		if install.LastActiveAt.IsZero() {
+			install.LastActiveAt = now
+			next.Installations[id] = install
+			changed = true
+			continue
+		}
+		if s.installationIdle > 0 && !active[id] && now.Sub(install.LastActiveAt) >= s.installationIdle {
+			if _, claimed := s.activeClaimsFor(id); claimed {
+				continue
+			}
+			delete(next.Installations, id)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return s.commit(next)
+}
+
+// activeClaimsFor reports whether a delivery for installation id is being
+// sent right now. Call with the mutex held.
+func (s *Store) activeClaimsFor(id string) (string, bool) {
+	for deliveryID := range s.activeClaims {
+		if record, ok := s.state.Deliveries[deliveryID]; ok {
+			if sub, ok := s.state.Subscriptions[record.Request.SubscriptionID]; ok && sub.InstallationID == id {
+				return deliveryID, true
+			}
+		}
+	}
+	return "", false
 }

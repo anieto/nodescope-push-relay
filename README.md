@@ -157,6 +157,40 @@ without the credential, stop the relay and start it with a fresh state file.
 This resets all enrollments and subscriptions, so re-enroll every analyzer
 and register and link its devices again.
 
+## Data, retention and limits
+
+The relay stores only what it needs to deliver alerts:
+
+- **Installations:** the push provider, environment and device token, plus a
+  hash of the installation credential. Tokens are blanked when the provider
+  reports them invalid.
+- **Analyzers:** the enrolled origin and a hash of the sender credential.
+- **Subscriptions:** which installation receives alerts from which analyzer.
+  They last 30 days unless renewed and are removed a day after they end.
+- **Deliveries:** the event (kind, node public key, optional node name,
+  times). They are removed an hour after the event expires; events live at
+  most an hour.
+- **Link proofs and enrollment codes:** short-lived; unused proofs are
+  removed when they expire (5 minutes).
+
+In `staging` and `production` mode the whole state file is encrypted with
+`RELAY_STATE_KEY`. The relay logs no tokens, credentials or node names.
+
+Expired records are pruned every 10 minutes. Set
+`RELAY_INSTALLATION_IDLE_DAYS` to also remove installations that have had no
+active subscription and no activity (registration, token update, link) for
+that many days. It is off by default: a client must register again when the
+relay answers `404 unknown_installation`, so enable it only once the clients
+in use do that.
+
+Quotas are per owner so one client cannot exhaust the relay for others:
+8 unused link proofs per installation; 120 deliveries per hour per analyzer
+(12 per subscription); self-enrollment at most 2 new analyzers per
+registrable domain per day; 16 analyzers per installation. Revoked analyzers
+do not count toward the 128 active analyzers. The remaining relay-wide caps
+only bound memory. Public write routes also have a relay-wide per-minute
+limit; put a per-IP rate limit in front of the relay at the proxy.
+
 ## Enable real providers
 
 Set `RELAY_MODE=staging` or `RELAY_MODE=production` and use a fresh state

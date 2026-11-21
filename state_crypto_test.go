@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -67,17 +68,23 @@ func TestProductionStateIsEncryptedAndSeparateFromStaging(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Real-provider modes check token shape: APNs hex, FCM registration IDs.
+	tokens := map[string]string{
+		"apns": strings.Repeat("ab", 32),
+		"fcm":  "fixture-production-token:" + strings.Repeat("Q", 32),
+	}
 	for _, provider := range []string{"apns", "fcm"} {
 		for _, mode := range []string{"staging", "production"} {
 			env := providerEnvironment(mode, provider)
-			_, err := store.RegisterInstallation(InstallRequest{Provider: provider, Environment: env, Token: "fixture-production-token"})
+			_, err := store.RegisterInstallation(InstallRequest{Provider: provider, Environment: env, Token: tokens[provider]})
 			if (err == nil) != (mode == "production") {
 				t.Fatalf("register %s/%s: %v", provider, env, err)
 			}
 		}
 	}
 	raw, err := os.ReadFile(production)
-	if err != nil || !bytes.HasPrefix(raw, []byte(productionStatePrefix)) || bytes.Contains(raw, []byte("fixture-production-token")) {
+	if err != nil || !bytes.HasPrefix(raw, []byte(productionStatePrefix)) || bytes.Contains(raw, []byte("fixture-production-token")) ||
+		bytes.Contains(raw, []byte(tokens["apns"])) {
 		t.Fatal("production state is not encrypted with its own format")
 	}
 	if _, err := openEncryptedStore(production, time.Now, key, "production"); err != nil {
