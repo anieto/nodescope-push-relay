@@ -31,6 +31,7 @@ type relayHTTP struct {
 	selfEnrollLimit      relayRequestLimit
 	selfEnrollSlots      chan struct{}
 	fetchEnrollmentProof enrollmentProofFetcher
+	publicOrigin         string // Signed into self-enrollment proofs.
 }
 
 // relayRequestLimit bounds public writes independently. It uses a single
@@ -58,10 +59,12 @@ func (l *relayRequestLimit) allow(now time.Time) time.Duration {
 }
 
 func NewHandler(store *Store, operatorToken string) http.Handler {
-	return newRelayHandler(store, operatorToken, nil)
+	return newRelayHandler(store, operatorToken, nil, "")
 }
 
-func newRelayHandler(store *Store, operatorToken string, fetchProof enrollmentProofFetcher) http.Handler {
+// newRelayHandler serves self-enrollment when fetchProof is set; publicOrigin
+// is then the relay's own origin as relayPublicOrigin returns it.
+func newRelayHandler(store *Store, operatorToken string, fetchProof enrollmentProofFetcher, publicOrigin string) http.Handler {
 	api := &relayHTTP{
 		store:                store,
 		operator:             sha256.Sum256([]byte(operatorToken)),
@@ -71,6 +74,7 @@ func newRelayHandler(store *Store, operatorToken string, fetchProof enrollmentPr
 		selfEnrollLimit:      relayRequestLimit{limit: 12},
 		selfEnrollSlots:      make(chan struct{}, 3),
 		fetchEnrollmentProof: fetchProof,
+		publicOrigin:         publicOrigin,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", relayMethod(http.MethodGet, func(w http.ResponseWriter, _ *http.Request) {

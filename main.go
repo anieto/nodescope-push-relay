@@ -60,16 +60,20 @@ func run() error {
 		store.SetInstallationIdle(time.Duration(days) * 24 * time.Hour)
 	}
 	var fetchProof enrollmentProofFetcher
+	var publicOrigin string
 	switch os.Getenv("RELAY_SELF_ENROLL") {
 	case "true":
 		fetchProof = fetchPublicEnrollmentProof
+		if publicOrigin, err = relayPublicOrigin(os.Getenv("RELAY_PUBLIC_ORIGIN")); err != nil {
+			return err
+		}
 	case "", "false":
 	default:
 		return errors.New("RELAY_SELF_ENROLL must be true or false")
 	}
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           newRelayHandler(store, token, fetchProof),
+		Handler:           newRelayHandler(store, token, fetchProof, publicOrigin),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,

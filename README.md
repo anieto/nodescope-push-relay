@@ -119,7 +119,11 @@ before enrolling that origin again.
 ## Self-service enrollment
 
 Set `RELAY_SELF_ENROLL=true` to allow a CoreScope admin to enroll directly
-from the CoreScope admin UI. The default leaves the route disabled. The
+from the CoreScope admin UI, and `RELAY_PUBLIC_ORIGIN` to the relay's own
+public origin as CoreScope admins enter it (for example
+`https://push.nodescope.app`). The relay refuses to start with self-service
+enrollment on and no valid `RELAY_PUBLIC_ORIGIN`. The default leaves the
+route disabled. The
 manual code flow remains available for deployments that cannot make their
 proof endpoint publicly reachable.
 
@@ -138,8 +142,18 @@ generates a fresh 32-byte challenge and fetches
 that origin. If that path answers 404, the relay asks
 `/api/nodescope/enrollment-proof`, which CoreScope builds from before the
 rename still serve; any other failure ends the attempt. The response is
-JSON with a `signature` field containing the unpadded base64url Ed25519
-signature over the decoded challenge bytes.
+JSON with a `signature` field containing an unpadded base64url Ed25519
+signature over
+
+```
+"corescope-push-relay-proof-v1" LF <RELAY_PUBLIC_ORIGIN> LF <decoded challenge>
+```
+
+so a proof the analyzer made for a different relay does not verify here.
+The format is defined in CoreScope's push relay contract
+(`docs/specs/2026-11-22-push-relay-contract.md`). A proof from the legacy
+path is a signature over the bare challenge, which those builds produce;
+support for it goes away with that path.
 The relay registers the analyzer only after it verifies the signature.
 A successful request returns HTTP 201 with `analyzer_id` and
 `sender_credential`, as in the manual flow.

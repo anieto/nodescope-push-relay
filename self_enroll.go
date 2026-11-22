@@ -28,7 +28,43 @@ const (
 	selfEnrollmentDNSLimit      = 16
 )
 
-type enrollmentProofFetcher func(context.Context, string, string) ([]byte, error)
+// enrollmentProof is an analyzer's answer to a challenge. Legacy is set when
+// it came from the pre-rename path, whose CoreScope builds sign the bare
+// challenge.
+type enrollmentProof struct {
+	signature []byte
+	legacy    bool
+}
+
+type enrollmentProofFetcher func(context.Context, string, string) (enrollmentProof, error)
+
+// enrollmentProofContext and enrollmentProofMessage follow the CoreScope
+// push relay contract (docs/specs/2026-11-22-push-relay-contract.md,
+// Enrollment step 3): the analyzer signs the relay's own origin with the
+// challenge, so a proof obtained by another relay does not verify here.
+const enrollmentProofContext = "corescope-push-relay-proof-v1"
+
+func enrollmentProofMessage(relayOrigin string, challenge []byte) []byte {
+	return append([]byte(enrollmentProofContext+"\n"+relayOrigin+"\n"), challenge...)
+}
+
+// relayPublicOrigin returns the relay's own origin in the form analyzers
+// sign: https, lowercase host, no default port, no trailing slash.
+func relayPublicOrigin(raw string) (string, error) {
+	origin, err := canonicalOrigin(strings.TrimSuffix(strings.TrimSpace(raw), "/"))
+	if err != nil {
+		return "", errors.New("RELAY_PUBLIC_ORIGIN must be the relay's public HTTPS origin, such as https://push.example.org")
+	}
+	return enrollmentOriginKey(origin), nil
+}
+
+func (api *relayHTTP) verifyEnrollmentProof(key ed25519.PublicKey, challenge []byte, proof enrollmentProof) bool {
+	if proof.legacy {
+		// Pre-rename CoreScope builds only. Remove with the legacy path.
+		return ed25519.Verify(key, challenge, proof.signature)
+	}
+	return ed25519.Verify(key, enrollmentProofMessage(api.publicOrigin, challenge), proof.signature)
+}
 
 var dnsLabelPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
@@ -109,8 +145,8 @@ func (api *relayHTTP) selfEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), selfEnrollmentTimeout)
 	defer cancel()
-	signature, err := api.fetchEnrollmentProof(ctx, origin, base64.RawURLEncoding.EncodeToString(challenge))
-	if err != nil || !ed25519.Verify(ed25519.PublicKey(key), challenge, signature) {
+	proof, err := api.fetchEnrollmentProof(ctx, origin, base64.RawURLEncoding.EncodeToString(challenge))
+	if err != nil || !api.verifyEnrollmentProof(ed25519.PublicKey(key), challenge, proof) {
 		relayError(w, http.StatusUnprocessableEntity, "origin_verification_failed")
 		return
 	}
@@ -172,16 +208,16 @@ func enrollmentProofAddresses(addresses []netip.Addr) bool {
 	return true
 }
 
-func fetchPublicEnrollmentProof(ctx context.Context, origin, challenge string) ([]byte, error) {
+func fetchPublicEnrollmentProof(ctx context.Context, origin, challenge string) (enrollmentProof, error) {
 	u, err := url.Parse(origin)
 	if err != nil {
-		return nil, err
+		return enrollmentProof{}, err
 	}
 	host := u.Hostname()
 	// Use an absolute DNS lookup, then dial only the addresses checked here.
 	addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host+".")
 	if err != nil || !enrollmentProofAddresses(addresses) {
-		return nil, errors.New("origin must resolve only to public addresses")
+		return enrollmentProof{}, errors.New("origin must resolve only to public addresses")
 	}
 
 	dialer := net.Dialer{Timeout: 750 * time.Millisecond}
@@ -216,16 +252,16 @@ func fetchPublicEnrollmentProof(ctx context.Context, origin, challenge string) (
 // requestEnrollmentProof asks the current proof path first and the legacy
 // path only when the analyzer answers 404, so an older CoreScope can still
 // enroll. Any other failure ends the attempt.
-func requestEnrollmentProof(ctx context.Context, client *http.Client, u url.URL) ([]byte, error) {
+func requestEnrollmentProof(ctx context.Context, client *http.Client, u url.URL) (enrollmentProof, error) {
 	for _, path := range []string{selfEnrollmentProofPath, legacyEnrollmentProofPath} {
 		u.Path = path
 		signature, status, err := getEnrollmentProof(ctx, client, u.String())
 		if status == http.StatusNotFound {
 			continue
 		}
-		return signature, err
+		return enrollmentProof{signature: signature, legacy: path == legacyEnrollmentProofPath}, err
 	}
-	return nil, errors.New("analyzer serves no enrollment proof")
+	return enrollmentProof{}, errors.New("analyzer serves no enrollment proof")
 }
 
 func getEnrollmentProof(ctx context.Context, client *http.Client, target string) ([]byte, int, error) {
