@@ -51,11 +51,11 @@ func testAPNsKeyFile(t *testing.T, key *ecdsa.PrivateKey) string {
 
 func TestAPNsSenderRequiresP256AndHTTP2(t *testing.T) {
 	prodKeyPath := testAPNsKeyFile(t, testAPNsKey(t, elliptic.P256()))
-	if _, err := newAPNsSender("TEAMID1234", "PUSHKEY123", "com.btdev.nodescope", prodKeyPath, "development"); err != nil {
+	if _, err := newAPNsSender("TEAMID1234", "PUSHKEY123", "com.btdev.nodescope", prodKeyPath, "development", ""); err != nil {
 		t.Fatal(err)
 	}
 	badKeyPath := testAPNsKeyFile(t, testAPNsKey(t, elliptic.P384()))
-	if _, err := newAPNsSender("TEAMID1234", "PUSHKEY123", "com.btdev.nodescope", badKeyPath, "development"); err == nil {
+	if _, err := newAPNsSender("TEAMID1234", "PUSHKEY123", "com.btdev.nodescope", badKeyPath, "development", ""); err == nil {
 		t.Fatal("accepted a P-384 signing key")
 	}
 	client := newAPNsClient()

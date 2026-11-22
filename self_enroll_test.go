@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -140,5 +144,51 @@ func TestDecodeEnrollmentProofLimitsResponse(t *testing.T) {
 		if _, err := decodeEnrollmentProof(strings.NewReader(input)); err == nil {
 			t.Errorf("accepted invalid proof response (%d bytes)", len(input))
 		}
+	}
+}
+
+// The relay asks the current proof path first and falls back to the legacy
+// path only on 404.
+func TestEnrollmentProofPathFallback(t *testing.T) {
+	signature := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{7}, ed25519.SignatureSize))
+	for _, tc := range []struct {
+		name          string
+		current       int
+		legacy        int
+		ok            bool
+		wantRequested []string
+	}{
+		{"current path", 200, 200, true, []string{selfEnrollmentProofPath}},
+		{"legacy analyzer", 404, 200, true, []string{selfEnrollmentProofPath, legacyEnrollmentProofPath}},
+		{"current path fails", 500, 200, false, []string{selfEnrollmentProofPath}},
+		{"no proof route", 404, 404, false, []string{selfEnrollmentProofPath, legacyEnrollmentProofPath}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requested []string
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requested = append(requested, r.URL.Path)
+				if r.URL.Query().Get("challenge") != "abc" {
+					t.Errorf("challenge not passed on %s", r.URL.Path)
+				}
+				status := tc.legacy
+				if r.URL.Path == selfEnrollmentProofPath {
+					status = tc.current
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				if status == 200 {
+					fmt.Fprintf(w, `{"signature":%q}`, signature)
+				}
+			}))
+			defer server.Close()
+			u, _ := url.Parse(server.URL + "?challenge=abc")
+			got, err := requestEnrollmentProof(context.Background(), server.Client(), *u)
+			if (err == nil) != tc.ok || (tc.ok && len(got) != ed25519.SignatureSize) {
+				t.Fatalf("proof = %d bytes, err %v; want ok=%v", len(got), err, tc.ok)
+			}
+			if strings.Join(requested, ",") != strings.Join(tc.wantRequested, ",") {
+				t.Fatalf("requested %v, want %v", requested, tc.wantRequested)
+			}
+		})
 	}
 }

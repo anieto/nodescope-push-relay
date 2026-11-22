@@ -56,6 +56,7 @@ type fcmAccessToken struct {
 type fcmClient struct {
 	projectID   string
 	environment string
+	title       string
 	email       string
 	keyID       string
 	key         *rsa.PrivateKey
@@ -66,7 +67,7 @@ type fcmClient struct {
 	refreshAt   time.Time
 }
 
-func newFCMSender(projectID, serviceAccountPath, environment string) (sendPush, error) {
+func newFCMSender(projectID, serviceAccountPath, environment, title string) (sendPush, error) {
 	if !fcmProjectID.MatchString(projectID) {
 		return nil, errors.New("invalid FCM project ID")
 	}
@@ -93,7 +94,9 @@ func newFCMSender(projectID, serviceAccountPath, environment string) (sendPush, 
 	if err != nil || !ok || key.N.BitLen() < 2048 || key.Validate() != nil {
 		return nil, errors.New("invalid FCM service account RSA key")
 	}
-	return newFCMClient(projectID, account, key, nil, time.Now, environment).send, nil
+	client := newFCMClient(projectID, account, key, nil, time.Now, environment)
+	client.title = title
+	return client.send, nil
 }
 
 func newFCMClient(projectID string, account fcmCredentials, key *rsa.PrivateKey, transport http.RoundTripper, now func() time.Time, environment string) *fcmClient {
@@ -220,7 +223,7 @@ func (c *fcmClient) send(ctx context.Context, job Job) SendResult {
 		if seconds <= 0 || seconds > 3600 {
 			return SendResult{Status: sendRejected}
 		}
-		title, body := relayAlert(job)
+		title, body := relayAlert(c.title, job)
 		request := fcmSendRequest{Message: fcmMessage{
 			Token: job.Token, Notification: fcmNotification{Title: title, Body: body}, Data: relayMetadata(job),
 			Android: fcmAndroidConfig{TTL: strconv.FormatInt(int64(seconds), 10) + "s", Priority: "high"},

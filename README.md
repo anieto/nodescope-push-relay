@@ -1,6 +1,11 @@
 # NodeScope push relay
 
 This standalone Go service implements the v1 CoreScope relay contract.
+NodeScope runs it at `https://push.nodescope.app`, and any app can run its
+own copy for its own users. The app's identity is configuration: the APNs
+topic, the Firebase project, the signing keys and the notification title.
+A relay can only deliver to the app whose push credentials it holds, so a
+copy run with other credentials cannot reach NodeScope users.
 It defaults to simulation. Staging and production use separate encrypted
 state and send through their configured APNs environment and Firebase
 project. Use synthetic tokens in simulation.
@@ -120,7 +125,7 @@ proof endpoint publicly reachable.
 
 Expose `POST /v1/analyzers/self-enroll` on the relay. Allow bounded outbound
 HTTPS from the relay to public analyzer hosts on port 443. The analyzer
-must expose `GET /api/nodescope/enrollment-proof` on the origin configured
+must expose `GET /api/push-relay/enrollment-proof` on the origin configured
 in CoreScope, through its HTTPS proxy or tunnel. The relay requires a
 public DNS hostname and a valid TLS certificate, verifies the DNS answers
 before connecting, and rejects redirects.
@@ -129,9 +134,12 @@ When the admin starts enrollment, CoreScope sends the analyzer origin, an
 ephemeral Ed25519 public key, and a randomly generated 32-byte sender
 credential. The key and credential use unpadded base64url. The relay
 generates a fresh 32-byte challenge and fetches
-`/api/nodescope/enrollment-proof?challenge=<base64url-challenge>` from
-that origin. The response is JSON with a `signature` field containing the
-unpadded base64url Ed25519 signature over the decoded challenge bytes.
+`/api/push-relay/enrollment-proof?challenge=<base64url-challenge>` from
+that origin. If that path answers 404, the relay asks
+`/api/nodescope/enrollment-proof`, which CoreScope builds from before the
+rename still serve; any other failure ends the attempt. The response is
+JSON with a `signature` field containing the unpadded base64url Ed25519
+signature over the decoded challenge bytes.
 The relay registers the analyzer only after it verifies the signature.
 A successful request returns HTTP 201 with `analyzer_id` and
 `sender_credential`, as in the manual flow.
@@ -203,10 +211,14 @@ Supply the following as service configuration.
 | `RELAY_STATE_KEY` | Independent random 32-byte key encoded as unpadded base64url |
 | `RELAY_APNS_TEAM_ID` | Apple Developer Team ID |
 | `RELAY_APNS_KEY_ID` | APNs signing key ID |
-| `RELAY_APNS_TOPIC` | App bundle ID, defaulting to `com.btdev.nodescope` |
+| `RELAY_APNS_TOPIC` | App bundle ID, defaulting to `com.btdev.nodescope` (NodeScope) |
 | `RELAY_APNS_KEY_PATH` | Mounted read-only APNs `.p8` signing key |
 | `RELAY_FCM_PROJECT_ID` | Firebase project ID for this deployment |
 | `RELAY_FCM_SERVICE_ACCOUNT_PATH` | Mounted read-only Firebase service-account JSON |
+| `RELAY_NOTIFICATION_TITLE` | Optional alert title, one line of at most 64 characters, defaulting to `NodeScope` |
+
+A relay for another app sets `RELAY_APNS_TOPIC` and
+`RELAY_NOTIFICATION_TITLE` to that app's bundle ID and name.
 
 Use separate values for `RELAY_OPERATOR_TOKEN` and `RELAY_STATE_KEY`.
 Keep the state key in the deployment secret store and preserve it across

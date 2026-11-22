@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 func relayMetadata(job Job) map[string]string {
@@ -18,8 +19,15 @@ func relayMetadata(job Job) map[string]string {
 	}
 }
 
-func relayAlert(job Job) (title, body string) {
-	title = "NodeScope"
+const defaultNotificationTitle = "NodeScope"
+
+// relayAlert writes the visible alert text. The title is the app's name,
+// RELAY_NOTIFICATION_TITLE; an empty title means the default.
+func relayAlert(title string, job Job) (string, string) {
+	if title == "" {
+		title = defaultNotificationTitle
+	}
+	var body string
 	name := relayDisplayName(job.Request.NodeName)
 	if name != "" {
 		switch job.Request.Kind {
@@ -45,7 +53,21 @@ func relayAlert(job Job) (title, body string) {
 	default:
 		body = "A watched node changed state."
 	}
-	return
+	return title, body
+}
+
+// notificationTitle validates RELAY_NOTIFICATION_TITLE: one short line.
+func notificationTitle(raw string) (string, error) {
+	title := strings.TrimSpace(raw)
+	if title == "" {
+		return defaultNotificationTitle, nil
+	}
+	if utf8.RuneCountInString(title) > 64 || strings.IndexFunc(title, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.Is(unicode.Bidi_Control, r)
+	}) >= 0 {
+		return "", errors.New("RELAY_NOTIFICATION_TITLE must be one line of at most 64 characters")
+	}
+	return title, nil
 }
 
 // Keep community-provided names on one line and short enough for a notification.
@@ -72,15 +94,19 @@ func resolveSendPush(mode string, getenv func(string) string) (sendPush, error) 
 	case "", "simulate":
 		return simulatePush, nil
 	case "staging", "production":
+		title, err := notificationTitle(getenv("RELAY_NOTIFICATION_TITLE"))
+		if err != nil {
+			return nil, err
+		}
 		topic := getenv("RELAY_APNS_TOPIC")
 		if topic == "" {
 			topic = "com.btdev.nodescope"
 		}
-		apns, err := newAPNsSender(getenv("RELAY_APNS_TEAM_ID"), getenv("RELAY_APNS_KEY_ID"), topic, getenv("RELAY_APNS_KEY_PATH"), providerEnvironment(mode, "apns"))
+		apns, err := newAPNsSender(getenv("RELAY_APNS_TEAM_ID"), getenv("RELAY_APNS_KEY_ID"), topic, getenv("RELAY_APNS_KEY_PATH"), providerEnvironment(mode, "apns"), title)
 		if err != nil {
 			return nil, err
 		}
-		fcm, err := newFCMSender(getenv("RELAY_FCM_PROJECT_ID"), getenv("RELAY_FCM_SERVICE_ACCOUNT_PATH"), providerEnvironment(mode, "fcm"))
+		fcm, err := newFCMSender(getenv("RELAY_FCM_PROJECT_ID"), getenv("RELAY_FCM_SERVICE_ACCOUNT_PATH"), providerEnvironment(mode, "fcm"), title)
 		if err != nil {
 			return nil, err
 		}

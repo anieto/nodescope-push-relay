@@ -199,11 +199,11 @@ func TestFCMSenderRequiresMatchingStagingProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"other-project", "test-project/foreign"} {
-		if _, err := newFCMSender(id, path, "staging"); err == nil {
+		if _, err := newFCMSender(id, path, "staging", ""); err == nil {
 			t.Fatalf("accepted unexpected project %q", id)
 		}
 	}
-	if _, err := newFCMSender("test-project", path, "staging"); err != nil {
+	if _, err := newFCMSender("test-project", path, "staging", ""); err != nil {
 		t.Fatal(err)
 	}
 }

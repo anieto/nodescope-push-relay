@@ -36,17 +36,17 @@ var (
 )
 
 type apnsSender struct {
-	teamID, keyID, topic, environment string
-	key                               *ecdsa.PrivateKey
-	client                            *http.Client
-	now                               func() time.Time
+	teamID, keyID, topic, environment, title string
+	key                                      *ecdsa.PrivateKey
+	client                                   *http.Client
+	now                                      func() time.Time
 
 	mu       sync.Mutex
 	jwt      string
 	issuedAt time.Time
 }
 
-func newAPNsSender(teamID, keyID, topic, keyPath, environment string) (sendPush, error) {
+func newAPNsSender(teamID, keyID, topic, keyPath, environment, title string) (sendPush, error) {
 	if !apnsProviderID.MatchString(teamID) || !apnsProviderID.MatchString(keyID) || !apnsBundleTopic.MatchString(topic) {
 		return nil, errors.New("invalid APNs team ID, key ID, or topic")
 	}
@@ -54,7 +54,7 @@ func newAPNsSender(teamID, keyID, topic, keyPath, environment string) (sendPush,
 	if err != nil {
 		return nil, err
 	}
-	sender := &apnsSender{teamID: teamID, keyID: keyID, topic: topic, environment: environment, key: key, client: newAPNsClient(), now: time.Now}
+	sender := &apnsSender{teamID: teamID, keyID: keyID, topic: topic, environment: environment, title: title, key: key, client: newAPNsClient(), now: time.Now}
 	return sender.send, nil
 }
 
@@ -152,7 +152,7 @@ func (s *apnsSender) send(ctx context.Context, job Job) SendResult {
 		return SendResult{Status: sendRejected}
 	}
 
-	title, body := relayAlert(job)
+	title, body := relayAlert(s.title, job)
 	payload := make(map[string]any, 7)
 	for name, value := range relayMetadata(job) {
 		payload[name] = value

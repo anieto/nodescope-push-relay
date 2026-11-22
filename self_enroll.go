@@ -20,7 +20,9 @@ import (
 )
 
 const (
-	selfEnrollmentProofPath     = "/api/nodescope/enrollment-proof"
+	selfEnrollmentProofPath = "/api/push-relay/enrollment-proof"
+	// CoreScope builds from before the push relay rename serve the proof here.
+	legacyEnrollmentProofPath   = "/api/nodescope/enrollment-proof"
 	selfEnrollmentTimeout       = 5 * time.Second
 	selfEnrollmentResponseLimit = 1024
 	selfEnrollmentDNSLimit      = 16
@@ -207,22 +209,41 @@ func fetchPublicEnrollmentProof(ctx context.Context, origin, challenge string) (
 		Transport:     transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
-	u.Path = selfEnrollmentProofPath
 	u.RawQuery = url.Values{"challenge": {challenge}}.Encode()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	return requestEnrollmentProof(ctx, client, *u)
+}
+
+// requestEnrollmentProof asks the current proof path first and the legacy
+// path only when the analyzer answers 404, so an older CoreScope can still
+// enroll. Any other failure ends the attempt.
+func requestEnrollmentProof(ctx context.Context, client *http.Client, u url.URL) ([]byte, error) {
+	for _, path := range []string{selfEnrollmentProofPath, legacyEnrollmentProofPath} {
+		u.Path = path
+		signature, status, err := getEnrollmentProof(ctx, client, u.String())
+		if status == http.StatusNotFound {
+			continue
+		}
+		return signature, err
+	}
+	return nil, errors.New("analyzer serves no enrollment proof")
+}
+
+func getEnrollmentProof(ctx context.Context, client *http.Client, target string) ([]byte, int, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer response.Body.Close()
 	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if response.StatusCode != http.StatusOK || err != nil || mediaType != "application/json" {
-		return nil, errors.New("invalid proof response")
+		return nil, response.StatusCode, errors.New("invalid proof response")
 	}
-	return decodeEnrollmentProof(response.Body)
+	signature, err := decodeEnrollmentProof(response.Body)
+	return signature, response.StatusCode, err
 }
 
 func decodeEnrollmentProof(r io.Reader) ([]byte, error) {
