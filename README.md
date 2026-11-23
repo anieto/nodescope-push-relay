@@ -139,9 +139,7 @@ ephemeral Ed25519 public key, and a randomly generated 32-byte sender
 credential. The key and credential use unpadded base64url. The relay
 generates a fresh 32-byte challenge and fetches
 `/api/push-relay/enrollment-proof?challenge=<base64url-challenge>` from
-that origin. If that path answers 404, the relay asks
-`/api/nodescope/enrollment-proof`, which CoreScope builds from before the
-rename still serve; any other failure ends the attempt. The response is
+that origin; any failure, a 404 included, ends the attempt. The response is
 JSON with a `signature` field containing an unpadded base64url Ed25519
 signature over
 
@@ -151,9 +149,8 @@ signature over
 
 so a proof the analyzer made for a different relay does not verify here.
 The format is defined in CoreScope's push relay contract
-(`docs/specs/2026-11-22-push-relay-contract.md`). A proof from the legacy
-path is a signature over the bare challenge, which those builds produce;
-support for it goes away with that path.
+(`docs/specs/2026-11-22-push-relay-contract.md`). A signature over the
+bare challenge is rejected.
 The relay registers the analyzer only after it verifies the signature.
 A successful request returns HTTP 201 with `analyzer_id` and
 `sender_credential`, as in the manual flow.

@@ -38,9 +38,8 @@ func TestSelfEnrollmentVerifiesOriginAndSupportsSafeRetry(t *testing.T) {
 	var previousSignature []byte
 	replayProof := false
 	// signFor is the relay origin the analyzer signs; "" signs the bare
-	// challenge, as pre-rename CoreScope builds do. legacyPath marks the
-	// proof as served from the pre-rename path.
-	signFor, legacyPath := relayOrigin, false
+	// challenge, which the relay rejects.
+	signFor := relayOrigin
 	fetch := func(_ context.Context, actualOrigin, challenge string) (enrollmentProof, error) {
 		if actualOrigin != origin || challenge == previousChallenge {
 			t.Fatalf("invalid challenge request: origin %q, repeated challenge %t", actualOrigin, challenge == previousChallenge)
@@ -58,7 +57,7 @@ func TestSelfEnrollmentVerifiesOriginAndSupportsSafeRetry(t *testing.T) {
 			message = enrollmentProofMessage(signFor, raw)
 		}
 		previousSignature = ed25519.Sign(signer, message)
-		return enrollmentProof{signature: previousSignature, legacy: legacyPath}, nil
+		return enrollmentProof{signature: previousSignature}, nil
 	}
 	credential := secret()
 	request := func(address string, key ed25519.PublicKey, credential string) string {
@@ -78,7 +77,7 @@ func TestSelfEnrollmentVerifiesOriginAndSupportsSafeRetry(t *testing.T) {
 	relayHTTPTestRequest(t, handler, http.MethodPost, selfEnroll, request(origin, key, "malformed"), "", http.StatusBadRequest)
 	relayHTTPTestRequest(t, handler, http.MethodPost, selfEnroll, request(origin, otherKey, credential), "", http.StatusUnprocessableEntity)
 	// A proof the analyzer made for another relay, or a bare-challenge
-	// signature from the current path, must not enroll it here.
+	// signature, must not enroll it here.
 	signFor = "https://other-relay.example.org"
 	relayHTTPTestRequest(t, handler, http.MethodPost, selfEnroll, payload, "", http.StatusUnprocessableEntity)
 	signFor = ""
@@ -163,22 +162,15 @@ func TestDecodeEnrollmentProofLimitsResponse(t *testing.T) {
 	}
 }
 
-// The relay asks the current proof path first and falls back to the legacy
-// path only on 404.
-func TestEnrollmentProofPathFallback(t *testing.T) {
+// The relay asks only the contract's proof path; a 404 there ends the
+// attempt (there is no older path to fall back to).
+func TestEnrollmentProofPath(t *testing.T) {
 	signature := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{7}, ed25519.SignatureSize))
 	for _, tc := range []struct {
-		name          string
-		current       int
-		legacy        int
-		ok            bool
-		wantRequested []string
-	}{
-		{"current path", 200, 200, true, []string{selfEnrollmentProofPath}},
-		{"legacy analyzer", 404, 200, true, []string{selfEnrollmentProofPath, legacyEnrollmentProofPath}},
-		{"current path fails", 500, 200, false, []string{selfEnrollmentProofPath}},
-		{"no proof route", 404, 404, false, []string{selfEnrollmentProofPath, legacyEnrollmentProofPath}},
-	} {
+		name   string
+		status int
+		ok     bool
+	}{{"proof", 200, true}, {"no proof route", 404, false}, {"proof route fails", 500, false}} {
 		t.Run(tc.name, func(t *testing.T) {
 			var requested []string
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -186,13 +178,9 @@ func TestEnrollmentProofPathFallback(t *testing.T) {
 				if r.URL.Query().Get("challenge") != "abc" {
 					t.Errorf("challenge not passed on %s", r.URL.Path)
 				}
-				status := tc.legacy
-				if r.URL.Path == selfEnrollmentProofPath {
-					status = tc.current
-				}
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(status)
-				if status == 200 {
+				w.WriteHeader(tc.status)
+				if tc.status == 200 {
 					fmt.Fprintf(w, `{"signature":%q}`, signature)
 				}
 			}))
@@ -202,11 +190,8 @@ func TestEnrollmentProofPathFallback(t *testing.T) {
 			if (err == nil) != tc.ok || (tc.ok && len(got.signature) != ed25519.SignatureSize) {
 				t.Fatalf("proof = %d bytes, err %v; want ok=%v", len(got.signature), err, tc.ok)
 			}
-			if wantLegacy := len(tc.wantRequested) == 2; tc.ok && got.legacy != wantLegacy {
-				t.Fatalf("legacy = %v, want %v", got.legacy, wantLegacy)
-			}
-			if strings.Join(requested, ",") != strings.Join(tc.wantRequested, ",") {
-				t.Fatalf("requested %v, want %v", requested, tc.wantRequested)
+			if strings.Join(requested, ",") != selfEnrollmentProofPath {
+				t.Fatalf("requested %v, want only %s", requested, selfEnrollmentProofPath)
 			}
 		})
 	}
@@ -238,38 +223,5 @@ func TestEnrollmentProofMessageAndRelayOrigin(t *testing.T) {
 		if _, err := relayPublicOrigin(input); err == nil {
 			t.Errorf("accepted relay origin %q", input)
 		}
-	}
-}
-
-// A proof from the pre-rename path is a bare-challenge signature, and only
-// that: a bound proof served there is rejected.
-func TestLegacyPathProofSignsBareChallenge(t *testing.T) {
-	const relayOrigin = "https://push.example.org"
-	key, signer, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct {
-		name  string
-		bound bool
-		want  int
-	}{{"bare challenge", false, http.StatusCreated}, {"bound proof", true, http.StatusUnprocessableEntity}} {
-		t.Run(tc.name, func(t *testing.T) {
-			st, err := OpenStore(filepath.Join(t.TempDir(), "relay.json"), time.Now)
-			if err != nil {
-				t.Fatal(err)
-			}
-			fetch := func(_ context.Context, _, challenge string) (enrollmentProof, error) {
-				raw, _ := canonicalProofEncoding(challenge, 32)
-				if tc.bound {
-					raw = enrollmentProofMessage(relayOrigin, raw)
-				}
-				return enrollmentProof{signature: ed25519.Sign(signer, raw), legacy: true}, nil
-			}
-			body, _ := json.Marshal(map[string]string{
-				"origin": "https://analyzer.example.org", "public_key": base64.RawURLEncoding.EncodeToString(key), "sender_credential": secret(),
-			})
-			relayHTTPTestRequest(t, newRelayHandler(st, "operator", fetch, relayOrigin), http.MethodPost, "/v1/analyzers/self-enroll", string(body), "", tc.want)
-		})
 	}
 }
