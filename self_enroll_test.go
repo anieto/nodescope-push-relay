@@ -223,12 +223,18 @@ func TestEnrollmentProofMessageAndRelayOrigin(t *testing.T) {
 		"https://push.nodescope.app":        "https://push.nodescope.app",
 		" https://PUSH.nodescope.app:443/ ": "https://push.nodescope.app",
 		"https://relay.example.org:8443":    "https://relay.example.org:8443",
+		"https://relay.example.org:":        "https://relay.example.org",
+		"https://relay.example.org:0443":    "https://relay.example.org",
+		"https://relay.example.org:08443":   "https://relay.example.org:8443",
+		"https://Relay.Example.org./":       "https://relay.example.org",
+		"https://xn--rlay-bpa.example.org":  "https://xn--rlay-bpa.example.org",
 	} {
 		if got, err := relayPublicOrigin(input); err != nil || got != want {
 			t.Errorf("relayPublicOrigin(%q) = %q, %v; want %q", input, got, err, want)
 		}
 	}
-	for _, input := range []string{"", "http://push.example.org", "https://push.example.org/v1", "push.example.org"} {
+	for _, input := range []string{"", "http://push.example.org", "https://push.example.org/v1", "push.example.org",
+		"https://rélay.example.org", "https://push.example.org:0", "https://push.example.org:65536"} {
 		if _, err := relayPublicOrigin(input); err == nil {
 			t.Errorf("accepted relay origin %q", input)
 		}

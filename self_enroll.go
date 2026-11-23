@@ -15,8 +15,10 @@ import (
 	"net/netip"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -49,13 +51,43 @@ func enrollmentProofMessage(relayOrigin string, challenge []byte) []byte {
 }
 
 // relayPublicOrigin returns the relay's own origin in the form analyzers
-// sign: https, lowercase host, no default port, no trailing slash.
+// sign (contract, Enrollment step 3): "https://", the host in lowercase ASCII
+// without a trailing dot (an internationalized name in its xn-- form), and
+// ":<port>" in plain decimal only when it isn't 443; no trailing slash.
 func relayPublicOrigin(raw string) (string, error) {
+	invalid := errors.New("RELAY_PUBLIC_ORIGIN must be the relay's public HTTPS origin, such as https://push.example.org")
 	origin, err := canonicalOrigin(strings.TrimSuffix(strings.TrimSpace(raw), "/"))
 	if err != nil {
-		return "", errors.New("RELAY_PUBLIC_ORIGIN must be the relay's public HTTPS origin, such as https://push.example.org")
+		return "", invalid
 	}
-	return enrollmentOriginKey(origin), nil
+	u, err := url.Parse(origin)
+	if err != nil {
+		return "", invalid
+	}
+	host := strings.TrimSuffix(u.Hostname(), ".")
+	if host == "" {
+		return "", invalid
+	}
+	for i := 0; i < len(host); i++ {
+		if host[i] >= utf8.RuneSelf {
+			return "", errors.New("RELAY_PUBLIC_ORIGIN host must be ASCII: write an internationalized domain name in its xn-- form")
+		}
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]" // IPv6 literal
+	}
+	port := u.Port()
+	if port == "" {
+		return "https://" + host, nil
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return "", invalid
+	}
+	if n == 443 {
+		return "https://" + host, nil
+	}
+	return "https://" + host + ":" + strconv.Itoa(n), nil
 }
 
 func (api *relayHTTP) verifyEnrollmentProof(key ed25519.PublicKey, challenge []byte, proof enrollmentProof) bool {
