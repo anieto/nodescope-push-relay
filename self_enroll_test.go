@@ -219,7 +219,8 @@ func TestEnrollmentProofMessageAndRelayOrigin(t *testing.T) {
 		}
 	}
 	for _, input := range []string{"", "http://push.example.org", "https://push.example.org/v1", "push.example.org",
-		"https://rélay.example.org", "https://push.example.org:0", "https://push.example.org:65536"} {
+		"https://rélay.example.org", "https://push.example.org:0", "https://push.example.org:65536",
+		"https://push.example.org..", "https://1.2.3.4:8443", "https://[2001:db8::1]", "https://[::1]:8443"} {
 		if _, err := relayPublicOrigin(input); err == nil {
 			t.Errorf("accepted relay origin %q", input)
 		}

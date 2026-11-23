@@ -68,8 +68,8 @@ func relayPublicOrigin(raw string) (string, error) {
 			return "", errors.New("RELAY_PUBLIC_ORIGIN host must be ASCII: write an internationalized domain name in its xn-- form")
 		}
 	}
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]" // IPv6 literal
+	if strings.HasSuffix(host, ".") || net.ParseIP(host) != nil || strings.Contains(host, ":") {
+		return "", invalid // more than one trailing dot, or an IP literal: the contract wants a DNS hostname
 	}
 	port := u.Port()
 	if port == "" {
